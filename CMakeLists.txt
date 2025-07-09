@@ -15,11 +15,27 @@ execute_process(
 set(pybind11_DIR ${pybind11_cmake_dir})
 find_package(pybind11 REQUIRED)
 
-# Find Arrow
+# Find Arrow & PyArrow
 find_package(Arrow REQUIRED)
+execute_process(COMMAND python3 -c "import pyarrow; print(pyarrow.get_include())"
+    OUTPUT_VARIABLE PyArrow_INCLUDE_DIR
+    OUTPUT_STRIP_TRAILING_WHITESPACE)
+execute_process(COMMAND python3 -c "import pyarrow; print(';'.join(pyarrow.get_library_dirs()))"
+    OUTPUT_VARIABLE PyArrow_LIBRARY_DIRS
+    OUTPUT_STRIP_TRAILING_WHITESPACE)
+execute_process(COMMAND python3 -c "import pyarrow; print(';'.join(pyarrow.get_libraries()))"
+    OUTPUT_VARIABLE PyArrow_LIBRARIES
+    OUTPUT_STRIP_TRAILING_WHITESPACE)
 
 # Add the pybind11 module
 pybind11_add_module(my_module cmath.cc)
+
+# Add the arrow_utils module
+pybind11_add_module(arrow_utils arrow_utils.cc)
+target_include_directories(arrow_utils PRIVATE ${PyArrow_INCLUDE_DIR} ${Arrow_INCLUDE_DIRS})
+target_link_directories(arrow_utils PRIVATE ${PyArrow_LIBRARY_DIRS})
+target_link_libraries(arrow_utils PRIVATE ${PyArrow_LIBRARIES})
+
 
 # Add the main executable
 add_executable(main main.cc)
