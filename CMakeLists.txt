@@ -26,3 +26,6 @@ add_executable(main main.cc)
 
 # Link Arrow to the executable
 target_link_libraries(main PRIVATE Arrow::arrow_shared)
+
+# Include Arrow headers
+target_include_directories(main PRIVATE ${Arrow_INCLUDE_DIRS})
