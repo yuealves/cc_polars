@@ -28,58 +28,96 @@ py::object extract_depth_feature(py::object py_batch, py::list py_depth_list) {
 
     int max_depth_level = col_cnt / 2;
 
-    if (static_cast<int64_t>(py_depth_list.size()) < 1) {
+    if (py_depth_list.empty()) {
         throw std::runtime_error("py_depth_list can't be empty");
     }
 
-    std::vector<double> result_vec;
-    result_vec.resize(batch->num_rows());
-  
     // Convert py::list to std::vector<double>
-    std::vector<double> depth_list;
-    depth_list.reserve(py_depth_list.size());
+    std::vector<double> depth_values;
+    depth_values.reserve(py_depth_list.size());
     for (auto item : py_depth_list) {
-        depth_list.push_back(item.cast<double>());
+        depth_values.push_back(item.cast<double>());
     }
 
+    // Validate that depth_values are sorted in ascending order
+    for (size_t i = 1; i < depth_values.size(); ++i) {
+        if (depth_values[i] < depth_values[i - 1]) {
+            throw std::runtime_error("depth_list must be sorted in ascending order");
+        }
+    }
+
+    // 1. Create intermediate storage: a vector of vectors for each depth feature
+    std::vector<std::vector<double>> results(depth_values.size());
+    for (auto& vec : results) {
+        vec.resize(batch->num_rows());
+    }
 
     std::vector<std::shared_ptr<arrow::DoubleArray>> double_columns;
+    double_columns.reserve(col_cnt);
     for (int i = 0; i < col_cnt; ++i) {
         double_columns.push_back(std::static_pointer_cast<arrow::DoubleArray>(batch->column(i)));
     }
 
-    // calculate the depth feature
-    for (int i = 0; i < batch->num_rows(); ++i) {
-      double depth = depth_list[0];
-      int depth_level = max_depth_level - 1;
-      for (int j = 0; j < max_depth_level; j++) {
-        depth -= (double_columns[j]->Value(i) * double_columns[j+max_depth_level]->Value(i));
-        if (depth < 0) {
-          depth_level = j;
-          break;
+    // 2. Optimized calculation loop, storing results in vectors
+    for (int64_t i = 0; i < batch->num_rows(); ++i) {
+        size_t depth_idx = 0;
+        double cumulative_subtrahend = 0.0;
+
+        for (int j = 0; j < max_depth_level; ++j) {
+            cumulative_subtrahend += (double_columns[j]->Value(i) * double_columns[j + max_depth_level]->Value(i));
+            
+            // Since depth_values is sorted, check which depths have now been resolved
+            while (depth_idx < depth_values.size() && depth_values[depth_idx] < cumulative_subtrahend) {
+                results[depth_idx][i] = std::abs(double_columns[j]->Value(i) - double_columns[0]->Value(0)) / double_columns[0]->Value(0);
+                depth_idx++;
+            }
+            if (depth_idx == depth_values.size()) {
+                break;
+            }
         }
-      }
-      result_vec[i] = double_columns[depth_level]->Value(i);
+
+        // Any remaining depth values (those larger than the total subtrahend)
+        // get the feature value from the last depth level
+        double last_level_value = double_columns[max_depth_level - 1]->Value(i);
+        while (depth_idx < depth_values.size()) {
+            results[depth_idx][i] = last_level_value;
+            depth_idx++;
+        }
     }
 
-    arrow::DoubleBuilder result_builder;
-    arrow::Status st = result_builder.AppendValues(result_vec);
-    if (!st.ok()) {
-        throw std::runtime_error("Failed to append result_vec values: " + st.ToString());
+    // 3. Build all arrays from the intermediate vectors
+    std::vector<std::shared_ptr<arrow::Array>> result_arrays;
+    std::vector<std::shared_ptr<arrow::Field>> result_fields;
+    result_arrays.reserve(depth_values.size());
+    result_fields.reserve(depth_values.size());
+
+    for (size_t i = 0; i < results.size(); ++i) {
+        arrow::DoubleBuilder builder;
+        arrow::Status st = builder.AppendValues(results[i]);
+        if (!st.ok()) {
+            throw std::runtime_error("Failed to append values for feature " + std::to_string(i));
+        }
+        
+        std::shared_ptr<arrow::Array> array;
+        st = builder.Finish(&array);
+        if (!st.ok()) {
+            throw std::runtime_error("Failed to finalize builder for feature " + std::to_string(i));
+        }
+        result_arrays.push_back(array);
+        result_fields.push_back(
+            arrow::field("feature_depth_" + std::to_string(i), arrow::float64()));
     }
 
-    std::shared_ptr<arrow::Array> result_array;
-    st = result_builder.Finish(&result_array);
-    if (!st.ok()) {
-        throw std::runtime_error("Failed to finalize builder: " + st.ToString());
-    }
+    auto new_schema = arrow::schema(result_fields);
 
-    // Wrap the arrow::Array back to a pyarrow.Array
-    PyObject* py_result_array = arrow::py::wrap_array(result_array);
-    if (py_result_array == NULL) {
+    // 4. Create and return the RecordBatch
+    auto new_batch = arrow::RecordBatch::Make(new_schema, batch->num_rows(), result_arrays);
+
+    PyObject* py_new_batch = arrow::py::wrap_batch(new_batch);
+    if (py_new_batch == NULL) {
         throw py::error_already_set();
     }
-    return py::reinterpret_steal<py::object>(py_result_array);
+    return py::reinterpret_steal<py::object>(py_new_batch);
 }
 
 PYBIND11_MODULE(arrow_utils, m) {
