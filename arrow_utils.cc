@@ -6,45 +6,18 @@
 #include <iostream>
 
 namespace py = pybind11;
-py::object extract_depth_feature(py::object py_batch, py::list py_depth_list) {
-    // Import pyarrow C++ API.
-    if (arrow::py::import_pyarrow() < 0) {
-        PyErr_SetString(PyExc_RuntimeError, "Could not import pyarrow.");
-        throw py::error_already_set();
-    }
 
-    // Unwrap RecordBatch
-    auto result = arrow::py::unwrap_batch(py_batch.ptr());
-    if (!result.ok()) {
-        PyErr_SetString(PyExc_RuntimeError, "Failed to unwrap RecordBatch.");
-        throw py::error_already_set();
-    }
-    std::shared_ptr<arrow::RecordBatch> batch = result.ValueOrDie();
-
+// Helper function to extract depth features from a single RecordBatch
+std::shared_ptr<arrow::RecordBatch> extract_depth_feature_from_batch(
+    std::shared_ptr<arrow::RecordBatch> batch, 
+    const std::vector<double>& depth_values) {
+    
     int col_cnt = batch->num_columns();
     if (col_cnt % 2) {
         throw std::runtime_error("Input RecordBatch must have an even number of columns.");
     }
 
     int max_depth_level = col_cnt / 2;
-
-    if (py_depth_list.empty()) {
-        throw std::runtime_error("py_depth_list can't be empty");
-    }
-
-    // Convert py::list to std::vector<double>
-    std::vector<double> depth_values;
-    depth_values.reserve(py_depth_list.size());
-    for (auto item : py_depth_list) {
-        depth_values.push_back(item.cast<double>());
-    }
-
-    // Validate that depth_values are sorted in ascending order
-    for (size_t i = 1; i < depth_values.size(); ++i) {
-        if (depth_values[i] < depth_values[i - 1]) {
-            throw std::runtime_error("depth_list must be sorted in ascending order");
-        }
-    }
 
     // 1. Create intermediate storage: a vector of vectors for each depth feature
     std::vector<std::vector<double>> results(depth_values.size());
@@ -111,17 +84,128 @@ py::object extract_depth_feature(py::object py_batch, py::list py_depth_list) {
     auto new_schema = arrow::schema(result_fields);
 
     // 4. Create and return the RecordBatch
-    auto new_batch = arrow::RecordBatch::Make(new_schema, batch->num_rows(), result_arrays);
+    return arrow::RecordBatch::Make(new_schema, batch->num_rows(), result_arrays);
+}
 
-    PyObject* py_new_batch = arrow::py::wrap_batch(new_batch);
+py::object extract_depth_feature(py::object py_batch, py::list py_depth_list) {
+    // Import pyarrow C++ API.
+    if (arrow::py::import_pyarrow() < 0) {
+        PyErr_SetString(PyExc_RuntimeError, "Could not import pyarrow.");
+        throw py::error_already_set();
+    }
+
+    // Unwrap RecordBatch
+    auto result = arrow::py::unwrap_batch(py_batch.ptr());
+    if (!result.ok()) {
+        PyErr_SetString(PyExc_RuntimeError, "Failed to unwrap RecordBatch.");
+        throw py::error_already_set();
+    }
+    std::shared_ptr<arrow::RecordBatch> batch = result.ValueOrDie();
+
+    if (py_depth_list.empty()) {
+        throw std::runtime_error("py_depth_list can't be empty");
+    }
+
+    // Convert py::list to std::vector<double>
+    std::vector<double> depth_values;
+    depth_values.reserve(py_depth_list.size());
+    for (auto item : py_depth_list) {
+        depth_values.push_back(item.cast<double>());
+    }
+
+    // Validate that depth_values are sorted in ascending order
+    for (size_t i = 1; i < depth_values.size(); ++i) {
+        if (depth_values[i] < depth_values[i - 1]) {
+            throw std::runtime_error("depth_list must be sorted in ascending order");
+        }
+    }
+
+    // Call the helper function
+    auto feature_batch = extract_depth_feature_from_batch(batch, depth_values);
+
+    // Wrap and return
+    PyObject* py_new_batch = arrow::py::wrap_batch(feature_batch);
     if (py_new_batch == NULL) {
         throw py::error_already_set();
     }
     return py::reinterpret_steal<py::object>(py_new_batch);
 }
 
+py::object extract_depth_feature_from_arrow_table(py::object py_table, py::list py_depth_list) {
+    // Import pyarrow C++ API.
+    if (arrow::py::import_pyarrow() < 0) {
+        PyErr_SetString(PyExc_RuntimeError, "Could not import pyarrow.");
+        throw py::error_already_set();
+    }
+
+    // Unwrap Table
+    auto result = arrow::py::unwrap_table(py_table.ptr());
+    if (!result.ok()) {
+        PyErr_SetString(PyExc_RuntimeError, "Failed to unwrap Table.");
+        throw py::error_already_set();
+    }
+    std::shared_ptr<arrow::Table> table = result.ValueOrDie();
+
+    if (py_depth_list.empty()) {
+        throw std::runtime_error("py_depth_list can't be empty");
+    }
+
+    // Convert py::list to std::vector<double>
+    std::vector<double> depth_values;
+    depth_values.reserve(py_depth_list.size());
+    for (auto item : py_depth_list) {
+        depth_values.push_back(item.cast<double>());
+    }
+
+    // Validate that depth_values are sorted in ascending order
+    for (size_t i = 1; i < depth_values.size(); ++i) {
+        if (depth_values[i] < depth_values[i - 1]) {
+            throw std::runtime_error("depth_list must be sorted in ascending order");
+        }
+    }
+
+    // Convert Table to RecordBatches
+    arrow::TableBatchReader reader(*table);
+    std::vector<std::shared_ptr<arrow::RecordBatch>> feature_batches;
+    std::shared_ptr<arrow::RecordBatch> batch;
+    
+    while (true) {
+        auto status = reader.ReadNext(&batch);
+        if (!status.ok()) {
+            throw std::runtime_error("Failed to read batch: " + status.ToString());
+        }
+        if (!batch) {
+            break; // End of batches
+        }
+        
+        // Use the helper function to process each batch
+        auto feature_batch = extract_depth_feature_from_batch(batch, depth_values);
+        feature_batches.push_back(feature_batch);
+    }
+
+    if (feature_batches.empty()) {
+        throw std::runtime_error("Table contains no RecordBatches");
+    }
+
+    // Combine all feature batches into a Table
+    auto feature_table_result = arrow::Table::FromRecordBatches(feature_batches);
+    if (!feature_table_result.ok()) {
+        throw std::runtime_error("Failed to create Table from RecordBatches: " + feature_table_result.status().ToString());
+    }
+    std::shared_ptr<arrow::Table> feature_table = feature_table_result.ValueOrDie();
+
+    // Wrap the Table back to a pyarrow.Table
+    PyObject* py_feature_table = arrow::py::wrap_table(feature_table);
+    if (py_feature_table == NULL) {
+        throw py::error_already_set();
+    }
+    return py::reinterpret_steal<py::object>(py_feature_table);
+}
+
 PYBIND11_MODULE(arrow_utils, m) {
-    m.doc() = "A module for processing Arrow RecordBatches";
+    m.doc() = "A module for processing Arrow RecordBatches and Tables";
     m.def("extract_depth_feature", &extract_depth_feature, "Extract depth feature from data in a pyarrow.RecordBatch object",
           py::arg("py_batch"), py::arg("depth_list"));
+    m.def("extract_depth_feature_from_arrow_table", &extract_depth_feature_from_arrow_table, "Extract depth feature from data in a pyarrow.Table object",
+          py::arg("py_table"), py::arg("depth_list"));
 }
