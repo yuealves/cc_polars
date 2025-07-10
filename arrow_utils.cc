@@ -6,18 +6,14 @@
 #include <iostream>
 
 namespace py = pybind11;
-
-// This function takes a pyarrow.RecordBatch, counts positive odd numbers
-// in the first 4 columns for each row, and returns a new RecordBatch
-// with the counts in a new 5th column.
-py::object process_record_batch(py::object py_batch) {
-    // Import pyarrow C++ API. Required for all pyarrow C++ functions.
+py::object extract_depth_feature(py::object py_batch, py::list py_depth_list) {
+    // Import pyarrow C++ API.
     if (arrow::py::import_pyarrow() < 0) {
         PyErr_SetString(PyExc_RuntimeError, "Could not import pyarrow.");
         throw py::error_already_set();
     }
 
-    // Convert pyarrow.RecordBatch to arrow::RecordBatch
+    // Unwrap RecordBatch
     auto result = arrow::py::unwrap_batch(py_batch.ptr());
     if (!result.ok()) {
         PyErr_SetString(PyExc_RuntimeError, "Failed to unwrap RecordBatch.");
@@ -25,58 +21,69 @@ py::object process_record_batch(py::object py_batch) {
     }
     std::shared_ptr<arrow::RecordBatch> batch = result.ValueOrDie();
 
-    if (batch->num_columns() != 4) {
-        throw std::runtime_error("Input RecordBatch must have exactly 4 columns.");
+    int col_cnt = batch->num_columns();
+    if (col_cnt % 2) {
+        throw std::runtime_error("Input RecordBatch must have an even number of columns.");
     }
 
-    arrow::Int64Builder count_builder;
-    arrow::Status st = count_builder.Reserve(batch->num_rows());
+    int max_depth_level = col_cnt / 2;
+
+    if (static_cast<int64_t>(py_depth_list.size()) < 1) {
+        throw std::runtime_error("py_depth_list can't be empty");
+    }
+
+    std::vector<double> result_vec;
+    result_vec.resize(batch->num_rows());
+  
+    // Convert py::list to std::vector<double>
+    std::vector<double> depth_list;
+    depth_list.reserve(py_depth_list.size());
+    for (auto item : py_depth_list) {
+        depth_list.push_back(item.cast<double>());
+    }
+
+
+    std::vector<std::shared_ptr<arrow::DoubleArray>> double_columns;
+    for (int i = 0; i < col_cnt; ++i) {
+        double_columns.push_back(std::static_pointer_cast<arrow::DoubleArray>(batch->column(i)));
+    }
+
+    // calculate the depth feature
+    for (int i = 0; i < batch->num_rows(); ++i) {
+      double depth = depth_list[0];
+      int depth_level = max_depth_level - 1;
+      for (int j = 0; j < max_depth_level; j++) {
+        depth -= (double_columns[j]->Value(i) * double_columns[j+max_depth_level]->Value(i));
+        if (depth < 0) {
+          depth_level = j;
+          break;
+        }
+      }
+      result_vec[i] = double_columns[depth_level]->Value(i);
+    }
+
+    arrow::DoubleBuilder result_builder;
+    arrow::Status st = result_builder.AppendValues(result_vec);
     if (!st.ok()) {
-        throw std::runtime_error("Failed to reserve memory for builder: " + st.ToString());
+        throw std::runtime_error("Failed to append result_vec values: " + st.ToString());
     }
 
-    std::vector<std::shared_ptr<arrow::Array>> original_columns;
-    for (int i = 0; i < 4; ++i) {
-        original_columns.push_back(batch->column(i));
-    }
-
-    for (int64_t i = 0; i < batch->num_rows(); ++i) {
-        int64_t odd_count = 0;
-        for (int j = 0; j < 4; ++j) {
-            // Assuming columns are Int64Array. Add checks/casting for other types if needed.
-            auto col = std::static_pointer_cast<arrow::Int64Array>(original_columns[j]);
-            if (!col->IsNull(i)) {
-                int64_t value = col->Value(i);
-                if (value > 0 && value % 2 != 0) {
-                    odd_count++;
-                }
-            }
-        }
-        st = count_builder.Append(odd_count);
-        if (!st.ok()) {
-            throw std::runtime_error("Failed to append data to builder: " + st.ToString());
-        }
-    }
-
-    std::shared_ptr<arrow::Array> count_array;
-    st = count_builder.Finish(&count_array);
+    std::shared_ptr<arrow::Array> result_array;
+    st = result_builder.Finish(&result_array);
     if (!st.ok()) {
         throw std::runtime_error("Failed to finalize builder: " + st.ToString());
     }
 
-    // The output is a single array (which will be a chunk in the ChunkedArray).
-    auto chunked_array = std::make_shared<arrow::ChunkedArray>(count_array);
-
-    // Wrap the new ChunkedArray back to a pyarrow.ChunkedArray
-    PyObject* py_new_array = arrow::py::wrap_chunked_array(chunked_array);
-    if (py_new_array == NULL) {
-        // The error is already set by wrap_chunked_array in case of failure
+    // Wrap the arrow::Array back to a pyarrow.Array
+    PyObject* py_result_array = arrow::py::wrap_array(result_array);
+    if (py_result_array == NULL) {
         throw py::error_already_set();
     }
-    return py::reinterpret_steal<py::object>(py_new_array);
+    return py::reinterpret_steal<py::object>(py_result_array);
 }
 
 PYBIND11_MODULE(arrow_utils, m) {
     m.doc() = "A module for processing Arrow RecordBatches";
-    m.def("process_record_batch", &process_record_batch, "Processes a 4-column RecordBatch and returns a ChunkedArray with counts of positive odd numbers.");
+    m.def("extract_depth_feature", &extract_depth_feature, "Extract depth feature from data in a pyarrow.RecordBatch object",
+          py::arg("py_batch"), py::arg("depth_list"));
 }
