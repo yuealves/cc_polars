@@ -4,6 +4,10 @@
 #include <arrow/builder.h>
 
 #include <iostream>
+#include <thread>
+#include <future>
+#include <vector>
+#include <algorithm>
 
 namespace py = pybind11;
 
@@ -131,7 +135,7 @@ py::object extract_depth_feature(py::object py_batch, py::list py_depth_list) {
     return py::reinterpret_steal<py::object>(py_new_batch);
 }
 
-py::object extract_depth_feature_from_arrow_table(py::object py_table, py::list py_depth_list) {
+py::object extract_depth_feature_from_arrow_table(py::object py_table, py::list py_depth_list, py::object py_max_threads = py::none()) {
     // Import pyarrow C++ API.
     if (arrow::py::import_pyarrow() < 0) {
         PyErr_SetString(PyExc_RuntimeError, "Could not import pyarrow.");
@@ -164,9 +168,9 @@ py::object extract_depth_feature_from_arrow_table(py::object py_table, py::list 
         }
     }
 
-    // Convert Table to RecordBatches
+    // First, collect all batches from the table
     arrow::TableBatchReader reader(*table);
-    std::vector<std::shared_ptr<arrow::RecordBatch>> feature_batches;
+    std::vector<std::shared_ptr<arrow::RecordBatch>> input_batches;
     std::shared_ptr<arrow::RecordBatch> batch;
     
     while (true) {
@@ -177,14 +181,64 @@ py::object extract_depth_feature_from_arrow_table(py::object py_table, py::list 
         if (!batch) {
             break; // End of batches
         }
-        
-        // Use the helper function to process each batch
-        auto feature_batch = extract_depth_feature_from_batch(batch, depth_values);
-        feature_batches.push_back(feature_batch);
+        input_batches.push_back(batch);
     }
 
-    if (feature_batches.empty()) {
+    if (input_batches.empty()) {
         throw std::runtime_error("Table contains no RecordBatches");
+    }
+
+    // Determine the number of threads to use
+    int max_threads;
+    if (py_max_threads.is_none()) {
+        // Default: min(cpu_cores, num_batches)
+        int cpu_cores = std::thread::hardware_concurrency();
+        max_threads = std::min(cpu_cores, static_cast<int>(input_batches.size()));
+    } else {
+        max_threads = py_max_threads.cast<int>();
+        if (max_threads <= 0) {
+            throw std::runtime_error("max_threads must be positive");
+        }
+        // Limit to actual number of batches
+        max_threads = std::min(max_threads, static_cast<int>(input_batches.size()));
+    }
+
+    // Process batches in parallel
+    std::vector<std::shared_ptr<arrow::RecordBatch>> feature_batches(input_batches.size());
+    std::vector<std::future<void>> futures;
+    futures.reserve(max_threads);
+
+    // Function to process a range of batches
+    auto process_batch_range = [&](int start_idx, int end_idx) {
+        for (int i = start_idx; i < end_idx; ++i) {
+            try {
+                feature_batches[i] = extract_depth_feature_from_batch(input_batches[i], depth_values);
+            } catch (const std::exception& e) {
+                throw std::runtime_error("Failed to process batch " + std::to_string(i) + ": " + e.what());
+            }
+        }
+    };
+
+    // Calculate batch ranges for each thread
+    int batches_per_thread = input_batches.size() / max_threads;
+    int remaining_batches = input_batches.size() % max_threads;
+
+    int current_start = 0;
+    for (int thread_id = 0; thread_id < max_threads; ++thread_id) {
+        int current_end = current_start + batches_per_thread;
+        if (thread_id < remaining_batches) {
+            current_end++; // Distribute remaining batches to first few threads
+        }
+        
+        if (current_start < current_end) {
+            futures.push_back(std::async(std::launch::async, process_batch_range, current_start, current_end));
+        }
+        current_start = current_end;
+    }
+
+    // Wait for all threads to complete
+    for (auto& future : futures) {
+        future.get(); // This will propagate any exceptions
     }
 
     // Combine all feature batches into a Table
@@ -206,6 +260,7 @@ PYBIND11_MODULE(arrow_utils, m) {
     m.doc() = "A module for processing Arrow RecordBatches and Tables";
     m.def("extract_depth_feature", &extract_depth_feature, "Extract depth feature from data in a pyarrow.RecordBatch object",
           py::arg("py_batch"), py::arg("depth_list"));
-    m.def("extract_depth_feature_from_arrow_table", &extract_depth_feature_from_arrow_table, "Extract depth feature from data in a pyarrow.Table object",
-          py::arg("py_table"), py::arg("depth_list"));
+    m.def("extract_depth_feature_from_arrow_table", &extract_depth_feature_from_arrow_table, 
+          "Extract depth feature from data in a pyarrow.Table object",
+          py::arg("py_table"), py::arg("depth_list"), py::arg("max_threads") = py::none());
 }
