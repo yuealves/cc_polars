@@ -44,9 +44,12 @@ std::shared_ptr<arrow::RecordBatch> extract_depth_feature_from_batch(
             cumulative_subtrahend += (double_columns[j]->Value(i) * double_columns[j + max_depth_level]->Value(i));
             
             // Since depth_values is sorted, check which depths have now been resolved
-            while (depth_idx < depth_values.size() && depth_values[depth_idx] < cumulative_subtrahend) {
-                results[depth_idx][i] = std::abs(double_columns[j]->Value(i) - double_columns[0]->Value(0)) / double_columns[0]->Value(0);
-                depth_idx++;
+            while (depth_idx < depth_values.size() &&
+                   depth_values[depth_idx] < cumulative_subtrahend) {
+              results[depth_idx][i] = std::abs(double_columns[j]->Value(i) -
+                                               double_columns[0]->Value(0)) /
+                                      double_columns[0]->Value(0);
+              depth_idx++;
             }
             if (depth_idx == depth_values.size()) {
                 break;
@@ -55,7 +58,10 @@ std::shared_ptr<arrow::RecordBatch> extract_depth_feature_from_batch(
 
         // Any remaining depth values (those larger than the total subtrahend)
         // get the feature value from the last depth level
-        double last_level_value = double_columns[max_depth_level - 1]->Value(i);
+        double last_level_value =
+            std::abs(double_columns[max_depth_level - 1]->Value(i) -
+                     double_columns[0]->Value(0)) /
+            double_columns[0]->Value(0);
         while (depth_idx < depth_values.size()) {
             results[depth_idx][i] = last_level_value;
             depth_idx++;
